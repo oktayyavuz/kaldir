@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Kaldır
+GenericName=Uygulama Kaldırıcı
+Comment=Kurulu uygulamaları boyutlarına göre listeler ve seçilenleri güvenle kaldırır
+Exec=@BIN_DIR@/kaldir-gui
+Icon=edit-delete
+Terminal=false
+Categories=System;PackageManager;
+Keywords=kaldır;sil;paket;uygulama;uninstall;remove;pacman;flatpak;

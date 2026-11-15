@@ -1,0 +1,4 @@
+# kaldir ve kaldir-gui bu dosyadaki paketleri silmez.
+# Her satıra bir paket adı yaz. İstersen # işaretinden sonra nedenini ekle.
+# Örnek:
+#   haruna   # video oynatıcım

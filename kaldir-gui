@@ -1,0 +1,924 @@
+#!/usr/bin/env python3
+"""kaldir-gui: Kurulu uygulamaları boyutlarına göre listeler, seçilenleri güvenle kaldırır.
+
+`kaldir` komutunun grafik arayüzlü sürümü. Pacman (resmi depo), AUR ve
+Flatpak uygulamalarını gösterir.
+
+Güvenlik kuralları:
+  * Korumalı paketler (çekirdek, önyükleyici, sürücüler, ağ, ses, masaüstü,
+    temel sistem...) seçilemez.
+  * "Dikkat" paketleri kaldırılabilir ama onay penceresinde ayrıca uyarı çıkar.
+  * Kaldırmadan önce pacman'in silinecekler listesi korumalı listeyle
+    karşılaştırılır; korumalı bir paket araya girerse işlem durdurulur.
+  * Pacman paketleri `-Rns` ile kaldırılır: başka bir paketin ihtiyaç duyduğu
+    bir paket seçilirse pacman reddeder, onu kullananlar silinmez.
+  * ~/.config/kaldir/korunan.txt dosyasına yazılan paketler de korunur.
+
+`kaldir-gui --korunanlar` korumalı paketleri "ad<TAB>neden" olarak yazdırır
+(terminaldeki `kaldir` komutu da bu listeyi kullanır).
+"""
+
+import glob
+import os
+import pwd
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+
+# --------------------------------------------------------------------------
+# Koruma kuralları
+# --------------------------------------------------------------------------
+
+USER_PROTECTED_FILE = os.path.expanduser("~/.config/kaldir/korunan.txt")
+
+# Silinmesi sistemi açılmaz, bağlantısız ya da masaüstüsüz bırakabilecek paketler
+PROTECTED = {
+    # Temel sistem
+    "base": "Temel sistem",
+    "base-devel": "Paket derleme araçları (AUR için gerekli)",
+    "systemd": "Sistem ve servis yöneticisi",
+    "pacman": "Paket yöneticisi",
+    "sudo": "Yönetici yetkisi",
+    "polkit": "Yetki penceresi (bu uygulama da kullanıyor)",
+    "dbus": "Sistem mesajlaşması",
+    "dbus-broker": "Sistem mesajlaşması",
+    "mkinitcpio": "Açılış imajını oluşturur",
+    "plymouth": "Açılış imajına bağlı açılış ekranı",
+    "linux-api-headers": "Sistem kütüphaneleri için gerekli",
+    "cryptsetup": "Disk şifreleme desteği (systemd kullanıyor)",
+    "device-mapper": "Disk birimi desteği (systemd kullanıyor)",
+    "e2fsprogs": "ext4 dosya sistemi araçları",
+    "logrotate": "Kayıt dosyalarının şişmesini önler",
+    "accountsservice": "Giriş ekranındaki kullanıcı listesi",
+    # Sistem betiklerinin kullandığı temel araçlar
+    "inetutils": "Temel araç (hostname komutu)",
+    "which": "Temel araç (betikler kullanır)",
+    "less": "Temel araç (sayfalayıcı; git, systemctl kullanır)",
+    "diffutils": "Temel araç (diff; paket derleme kullanır)",
+    "perl": "Temel araç (birçok sistem betiği kullanır)",
+    # Güvenlik ve güç
+    "ufw": "Güvenlik duvarın",
+    "power-profiles-daemon": "Güç profilleri (pil / dengeli / performans)",
+    "intel-ucode": "İşlemci mikrokodu",
+    "amd-ucode": "İşlemci mikrokodu",
+    "sof-firmware": "Ses kartı yazılımı",
+    "alsa-firmware": "Ses kartı yazılımı",
+    "archlinux-keyring": "Paket imza anahtarları",
+    "cachyos-keyring": "Paket imza anahtarları",
+    "cachyos-mirrorlist": "Paket sunucu listesi",
+    "cachyos-v3-mirrorlist": "Paket sunucu listesi",
+    "cachyos-v4-mirrorlist": "Paket sunucu listesi",
+    "cachyos-settings": "CachyOS sistem ayarları",
+    "cachyos-hooks": "CachyOS paket kancaları",
+    "cachyos-snapper-support": "Sistem anlık görüntüleri",
+    "chwd": "CachyOS donanım ve sürücü algılama",
+    # Önyükleme ve dosya sistemi
+    "limine": "Önyükleyici",
+    "limine-mkinitcpio-hook": "Çekirdekleri önyükleyiciye ekler",
+    "limine-snapper-sync": "Anlık görüntüleri önyükleme menüsüne ekler",
+    "grub": "Önyükleyici",
+    "efibootmgr": "UEFI önyükleme kayıtları",
+    "btrfs-progs": "Kök dosya sistemi araçları (btrfs)",
+    "dosfstools": "EFI bölümü araçları",
+    "snapper": "Sistem anlık görüntüleri",
+    "lvm2": "Disk birimleri (açılışta gerekebilir)",
+    # Ağ
+    "networkmanager": "İnternet bağlantısı",
+    "wpa_supplicant": "Wi-Fi bağlantısı",
+    "iwd": "Wi-Fi bağlantısı",
+    "plasma-nm": "Ağ simgesi ve ayarları",
+    # Masaüstü
+    "plasma-desktop": "Plasma masaüstü",
+    "plasma-workspace": "Plasma masaüstü",
+    "plasma-meta": "Plasma masaüstü",
+    "kwin": "Pencere yöneticisi",
+    "powerdevil": "Güç ve pil yönetimi",
+    "kscreen": "Ekran ayarları",
+    "plasma-pa": "Ses simgesi ve ayarları",
+    "xdg-desktop-portal": "Uygulama izin pencereleri",
+    "xdg-desktop-portal-kde": "Uygulama izin pencereleri",
+    "qt6-wayland": "Qt uygulamalarının Wayland desteği",
+    "xorg-xwayland": "X11 uygulamalarının çalışması",
+    "noto-fonts": "Plasma'nın ana yazı tipi",
+    # Ses
+    "alsa-utils": "Ses düzeyini açılışta geri yükler",
+    "alsa-plugins": "Eski ses uygulamalarını PipeWire'a bağlar",
+    "pipewire": "Ses sistemi",
+    "pipewire-pulse": "Ses sistemi",
+    "pipewire-alsa": "Ses sistemi",
+    "wireplumber": "Ses sistemi",
+    # Grafik ve sürücüler
+    "mesa": "Grafik sürücüsü",
+    "lib32-mesa": "Grafik sürücüsü (32 bit, oyunlar)",
+    "vulkan-intel": "Intel grafik sürücüsü",
+    "lib32-vulkan-intel": "Intel grafik sürücüsü (32 bit, oyunlar)",
+    "intel-media-driver": "Intel video hızlandırma",
+    "nvidia-utils": "NVIDIA sürücüsü",
+    "lib32-nvidia-utils": "NVIDIA sürücüsü (32 bit, oyunlar)",
+    "egl-wayland": "NVIDIA Wayland desteği",
+    "vulkan-icd-loader": "Vulkan (oyunlar, Proton, bazı uygulamalar)",
+    "lib32-vulkan-icd-loader": "Vulkan, 32 bit (oyunlar, Proton)",
+    # Bu araçların kendisi
+    "python": "kaldir-gui bununla çalışıyor",
+    "python-pyqt6": "kaldir-gui bununla çalışıyor",
+    "qt6-base": "kaldir-gui bununla çalışıyor",
+    "fzf": "kaldir komutu kullanıyor",
+    "yay": "AUR yardımcısı",
+    "git": "AUR paketleri için gerekli",
+}
+
+PROTECTED_PATTERNS = [
+    (r"^linux-firmware(-.+)?$", "Donanım yazılımları"),
+    (r"^linux-.+-nvidia(-open)?(-dkms)?$", "Çekirdeğin NVIDIA sürücü modülü"),
+    (r"^nvidia(-open)?(-dkms)?$", "NVIDIA sürücüsü"),
+    (r"^cachyos-plymouth-.+$", "Açılış imajına bağlı açılış ekranı"),
+]
+
+# Kaldırılabilir ama günlük kullanımı etkiler; onayda ayrıca uyarılır
+WARN = {
+    "dolphin": "Dosya yöneticisi",
+    "konsole": "Terminal",
+    "discover": "Yazılım merkezi ve güncellemeler",
+    "ark": "Arşiv (zip, rar) açma",
+    "spectacle": "Ekran görüntüsü alma",
+    "kate": "Metin düzenleyici",
+    "gwenview": "Resim görüntüleyici",
+    "partitionmanager": "Disk bölümleme",
+    "bluez-utils": "Bluetooth araçları",
+    "docker": "Kayıtlı konteyner ayarları etkilenebilir",
+    "openssh": "SSH bağlantıları ve git uzak depoları",
+    "nvidia-settings": "NVIDIA ayar paneli",
+    "nvidia-prime": "Uygulamaları NVIDIA kartta çalıştırma",
+    "flatpak": "Flatpak uygulamaları",
+    # Masaüstü ve görünüm
+    "kdeplasma-addons": "Masaüstü bileşenleri (saat, hava durumu vb.)",
+    "plasma-systemmonitor": "Sistem İzleyici",
+    "plasma-firewall": "Güvenlik duvarı ayar paneli",
+    "plasma-browser-integration": "Tarayıcı medya kontrolleri ve bildirimleri",
+    "kio-admin": "Dolphin'de yönetici olarak dosya açma",
+    "xdg-user-dirs": "Masaüstü, İndirilenler gibi klasörlerin tanımı",
+    "breeze-gtk": "GTK uygulamalarının görünümü",
+    "kde-gtk-config": "GTK uygulamalarının görünümü",
+    "xsettingsd": "X11 uygulamalarının görünümü",
+    "cachyos-kde-settings": "CachyOS masaüstü varsayılan ayarları",
+    "kwallet-pam": "Girişte cüzdanı otomatik açar (Wi-Fi şifreleri)",
+    "lsb-release": "Bazı uygulamalar sistem sürümünü buradan okur",
+    # Yazı tipleri
+    "ttf-dejavu": "Yazı tipi (birçok uygulamanın yedek yazı tipi)",
+    "ttf-liberation": "Yazı tipi (Arial, Times uyumlu; belgeler ve web)",
+    "noto-fonts-emoji": "Emoji yazı tipi",
+    "noto-fonts-cjk": "Japonca, Çince, Korece karakterler",
+    "cantarell-fonts": "GTK uygulamalarının yazı tipi",
+    "ttf-meslo-nerd": "Terminal simgeleri (starship)",
+    "awesome-terminal-fonts": "Terminal simgeleri",
+    # Ses ve medya
+    "bluez": "Bluetooth",
+    "bluedevil": "Bluetooth ayarları",
+    "phonon-qt6-vlc": "KDE ses arka ucu",
+    "gst-libav": "Ses ve video oynatma eklentisi",
+    "gst-plugins-bad": "Ses ve video oynatma eklentisi",
+    "gst-plugins-ugly": "Ses ve video oynatma eklentisi",
+    "gst-plugin-pipewire": "Ses ve video oynatma eklentisi",
+    "gst-plugin-va": "Donanım hızlandırmalı video oynatma",
+    "easyeffects": "Ses efektlerin",
+    "libdeep_filter_ladspa-bin": "EasyEffects gürültü engelleme",
+    "calf": "EasyEffects ses eklentileri",
+    "lsp-plugins": "EasyEffects ses eklentileri",
+    "realtime-privileges": "Ses için gerçek zamanlı öncelik",
+    # Donanım ve sürücüler
+    "libva-nvidia-driver": "NVIDIA ile video hızlandırma",
+    "opencl-nvidia": "NVIDIA ile hesaplama (OpenCL)",
+    "lib32-opencl-nvidia": "NVIDIA ile hesaplama (OpenCL, 32 bit)",
+    "switcheroo-control": "Uygulamayı NVIDIA kartta çalıştırma menüsü",
+    "intel-lpmd": "Intel düşük güç modu (pil ömrü)",
+    "fwupd": "Donanım yazılımı (BIOS vb.) güncellemeleri",
+    "keyd": "Klavye tuş eşleme",
+    "cameractrls": "Kamera ayarları",
+    # Ağ ve sistem araçları
+    "networkmanager-openvpn": "VPN bağlantıları",
+    "nss-mdns": "Yerel ağdaki cihazları adıyla bulma",
+    "rsync": "Dosya eşitleme (yedekleme araçları kullanır)",
+    "pacman-contrib": "Paket önbelleği temizleme araçları",
+    "cachyos-rate-mirrors": "Paket sunucularını hızına göre sıralar",
+    "cachyos-kernel-manager": "Çekirdek yönetimi aracı",
+    "cachy-update": "Güncelleme bildirimleri",
+    "hwdetect": "Donanım algılama (açılış imajı ayarları)",
+    "btrfs-assistant": "Anlık görüntü yönetimi",
+    "smartmontools": "Disk sağlığı takibi",
+    "nano": "Terminal metin düzenleyici",
+    "unzip": "Zip arşivlerini açma",
+    "unrar": "Rar arşivlerini açma",
+    "cachyos-gaming-meta": "Oyun bileşenleri demeti; Wine, Proton bağımlılıkları da gidebilir",
+    "cachyos-gaming-applications": "Oyun uygulamaları demeti; Steam, Lutris gibi uygulamalar da gidebilir",
+}
+
+WARN_PATTERNS = [
+    (r"^linux-.+-headers$", "Çekirdek başlıkları; bazı sürücüler derlenirken gerekir"),
+]
+
+UNITS = {
+    "B": 1,
+    "KIB": 1024, "MIB": 1024**2, "GIB": 1024**3, "TIB": 1024**4,
+    "KB": 1000, "MB": 1000**2, "GB": 1000**3, "TB": 1000**4,
+}
+
+C_ENV = {**os.environ, "LC_ALL": "C"}
+
+
+# --------------------------------------------------------------------------
+# Veri
+# --------------------------------------------------------------------------
+
+@dataclass
+class Package:
+    name: str
+    source: str              # "Pacman", "AUR" veya "Flatpak"
+    size: int                # bayt
+    description: str
+    installation: str = ""   # Flatpak için "system" ya da "user"
+    protected: str = ""      # boş değilse korumalı; değer = neden
+    warning: str = ""        # boş değilse dikkat gerektirir; değer = neden
+
+
+def to_bytes(value: str, unit: str) -> int:
+    try:
+        number = float(value.replace(",", "."))
+    except ValueError:
+        return 0
+    return int(number * UNITS.get(unit.upper(), 1))
+
+
+def human(size: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024:
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TiB"
+
+
+def _output(cmd: list[str]) -> str:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, env=C_ENV).stdout
+    except FileNotFoundError:
+        return ""
+
+
+def parse_pacman_info(text: str) -> list[dict]:
+    """`pacman -Qi` çıktısını paket başına sözlüğe çevirir (çok satırlı alanlar dahil)."""
+    blocks = []
+    for block in text.split("\n\n"):
+        info, last = {}, None
+        for line in block.splitlines():
+            if line.startswith(" ") and last:
+                info[last] += " " + line.strip()
+            elif " : " in line:
+                key, value = line.split(" : ", 1)
+                last = key.strip()
+                info[last] = value.strip()
+        if "Name" in info:
+            blocks.append(info)
+    return blocks
+
+
+def pacman_packages(flags: str, source: str) -> list[Package]:
+    packages = []
+    for info in parse_pacman_info(_output(["pacman", flags])):
+        value, unit = (info.get("Installed Size", "0 B").split() + ["B"])[:2]
+        packages.append(Package(info["Name"], source, to_bytes(value, unit),
+                                info.get("Description", "")))
+    return packages
+
+
+def flatpak_packages() -> list[Package]:
+    packages = []
+    out = _output(["flatpak", "list", "--app",
+                   "--columns=application,name,size,installation"])
+    for line in out.replace(" ", " ").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        app_id, name, size, installation = parts[:4]
+        value, unit = (size.split() + ["B"])[:2]
+        packages.append(Package(app_id, "Flatpak", to_bytes(value, unit),
+                                name, installation.strip().lower()))
+    return packages
+
+
+def _owners(path: str) -> set[str]:
+    if not path or not os.path.exists(path):
+        return set()
+    return set(_output(["pacman", "-Qqo", path]).split())
+
+
+def base_dependencies() -> set[str]:
+    for info in parse_pacman_info(_output(["pacman", "-Qi", "base"])):
+        deps = info.get("Depends On", "")
+        return {re.split(r"[<>=]", d)[0] for d in deps.split()} - {"None"}
+    return set()
+
+
+def user_protected() -> dict[str, str]:
+    """~/.config/kaldir/korunan.txt: her satırda bir paket, isteğe bağlı '# neden'."""
+    result = {}
+    try:
+        with open(USER_PROTECTED_FILE, encoding="utf-8") as f:
+            for line in f:
+                name, _, note = line.partition("#")
+                name = name.strip()
+                if name:
+                    result[name] = note.strip() or "Senin koruma listende"
+    except OSError:
+        pass
+    return result
+
+
+def _owners_of(paths: list[str]) -> dict[str, str]:
+    """Dosya -> sahibi paket (tek pacman çağrısıyla)."""
+    paths = [p for p in paths if os.path.exists(p)]
+    if not paths:
+        return {}
+    result = {}
+    for line in _output(["pacman", "-Qo", *paths]).splitlines():
+        m = re.match(r"^(\S+) is owned by (\S+) ", line)
+        if m:
+            result[m.group(1)] = m.group(2)
+    return result
+
+
+def dynamic_warnings() -> dict[str, str]:
+    """Bu makinede gerçekten kullanılanlardan uyarı nedenleri çıkarır: ad -> neden."""
+    reasons: dict[str, list[str]] = {}
+
+    def add(pkg, reason):
+        reasons.setdefault(pkg, [])
+        if reason not in reasons[pkg]:
+            reasons[pkg].append(reason)
+
+    # Açılışta çalışan servisler (sistem ve kullanıcı)
+    for scope, base in ((["systemctl"], "/usr/lib/systemd/system"),
+                        (["systemctl", "--user"], "/usr/lib/systemd/user")):
+        units = _output([*scope, "list-unit-files", "--state=enabled", "--no-legend",
+                         "--type=service,timer,socket,path"]).split("\n")
+        paths = {}
+        for line in units:
+            unit = line.split()[0] if line.split() else ""
+            if not unit:
+                continue
+            template = re.sub(r"@[^.]+\.", "@.", unit)  # getty@tty1.service -> getty@.service
+            paths[os.path.join(base, template)] = unit
+        for path, pkg in _owners_of(list(paths)).items():
+            add(pkg, f"Açılışta çalışıyor ({paths[path]})")
+
+    # .zshrc / .bashrc içinde ve oturum açılışında otomatik başlayan komutlar
+    def commands_in(text):
+        return {w for w in re.findall(r"\b[a-zA-Z][\w.+-]*\b", text) if os.path.exists(f"/usr/bin/{w}")}
+
+    sources = [("~/.zshrc", "Her terminal açılışında kullanılıyor (.zshrc)"),
+               ("~/.bashrc", "Her terminal açılışında kullanılıyor (.bashrc)")]
+    for path, reason in sources:
+        try:
+            with open(os.path.expanduser(path), encoding="utf-8") as f:
+                cmds = commands_in(f.read())
+        except OSError:
+            continue
+        for file, pkg in _owners_of([f"/usr/bin/{c}" for c in cmds]).items():
+            if pkg not in ("coreutils", "bash", "zsh", "grep", "sed", "gawk", "findutils"):
+                add(pkg, reason)
+
+    autostart = glob.glob(os.path.expanduser("~/.config/autostart/*.desktop"))
+    cmds = set()
+    for path in autostart:
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("Exec="):
+                        first = line[5:].split()[0] if line[5:].split() else ""
+                        name = os.path.basename(first)
+                        if os.path.exists(f"/usr/bin/{name}"):
+                            cmds.add(name)
+        except OSError:
+            continue
+    for file, pkg in _owners_of([f"/usr/bin/{c}" for c in cmds]).items():
+        add(pkg, "Oturum açılışında otomatik başlıyor")
+
+    return {pkg: " · ".join(r) for pkg, r in reasons.items()}
+
+
+def compute_protection(installed: set[str], has_flatpak_apps: bool) -> tuple[dict, dict]:
+    """Kurulu paketler için (korumalı, dikkat) sözlüklerini döndürür: ad -> neden."""
+    protected, warn = {}, {}
+
+    def mark(target, name, reason):
+        if name in installed and name not in target:
+            target[name] = reason
+
+    # Makineye özgü olanlar önce, nedenleri daha açıklayıcı
+    running = os.uname().release
+    for path in sorted(glob.glob("/usr/lib/modules/*/vmlinuz")):
+        version = path.split("/")[4]
+        for owner in _owners(path):
+            mark(protected, owner, "Şu an çalışan çekirdek" if version == running
+                 else "Yedek çekirdek (ana çekirdek açılmazsa gerekir)")
+    for owner in _owners(os.path.realpath("/etc/systemd/system/display-manager.service")):
+        mark(protected, owner, "Giriş ekranı")
+    try:
+        shell = os.path.realpath(pwd.getpwuid(os.getuid()).pw_shell)
+        for owner in _owners(shell):
+            mark(protected, owner, "Varsayılan kabuğun")
+    except KeyError:
+        pass
+    if has_flatpak_apps:
+        mark(protected, "flatpak", "Kurulu Flatpak uygulamaların var")
+
+    for name, reason in user_protected().items():
+        mark(protected, name, reason)
+    for name, reason in PROTECTED.items():
+        mark(protected, name, reason)
+    for name in base_dependencies():
+        mark(protected, name, "Temel sistemin parçası")
+    for name in installed:
+        for pattern, reason in PROTECTED_PATTERNS:
+            if re.match(pattern, name):
+                mark(protected, name, reason)
+
+    for name, reason in WARN.items():
+        mark(warn, name, reason)
+    for name in installed:
+        for pattern, reason in WARN_PATTERNS:
+            if re.match(pattern, name):
+                mark(warn, name, reason)
+    for name, reason in dynamic_warnings().items():
+        if name in warn:
+            warn[name] = f"{warn[name]} · {reason}"
+        else:
+            mark(warn, name, reason)
+    for name in list(warn):
+        if name in protected:
+            del warn[name]
+    return protected, warn
+
+
+def load_packages() -> tuple[list[Package], dict, dict]:
+    flatpaks = flatpak_packages()
+    packages = (pacman_packages("-Qeni", "Pacman")
+                + pacman_packages("-Qemi", "AUR")
+                + flatpaks)
+    installed = set(_output(["pacman", "-Qq"]).split())
+    protected, warn = compute_protection(installed, bool(flatpaks))
+    for pkg in packages:
+        if pkg.source != "Flatpak":
+            pkg.protected = protected.get(pkg.name, "")
+            pkg.warning = warn.get(pkg.name, "")
+    packages.sort(key=lambda p: p.size, reverse=True)
+    return packages, protected, warn
+
+
+def preview_pacman_removal(names: list[str]) -> tuple[bool, list[tuple[str, int]], str]:
+    """`pacman -Rns` ile birlikte silinecek paketleri döndürür (hiçbir şey silmez).
+
+    Dönüş: (başarılı mı, [(paket, bayt)], hata metni)
+    """
+    result = subprocess.run(
+        ["pacman", "-Rs", "--print", "--print-format", "%n %s", *names],
+        capture_output=True, text=True, env=C_ENV)
+    if result.returncode != 0:
+        # pacman ":: removing X breaks dependency ..." satırlarını stdout'a yazar
+        return False, [], f"{result.stderr}\n{result.stdout}".strip()
+    items = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].isdigit():
+            items.append((parts[0], int(parts[1])))
+    return True, items, ""
+
+
+def dependency_closure(roots: list[str], candidates: set[str]) -> set[str]:
+    """`roots` ve onların `candidates` içindeki (özyinelemeli) bağımlılıkları."""
+    if not candidates:
+        return set(roots)
+    info = {i["Name"]: i for i in parse_pacman_info(_output(["pacman", "-Qi", *sorted(candidates)]))}
+    keep, stack = set(), list(roots)
+    while stack:
+        name = stack.pop()
+        if name in keep:
+            continue
+        keep.add(name)
+        for dep in info.get(name, {}).get("Depends On", "").split():
+            dep = re.split(r"[<>=]", dep)[0]
+            if dep in candidates and dep not in keep:
+                stack.append(dep)
+    return keep
+
+
+def explain_dependency_error(error: str) -> list[str]:
+    """pacman'in 'breaks dependency' hatalarını okunur satırlara çevirir."""
+    pairs = re.findall(r"removing (\S+) breaks dependency '([^']+)' required by (\S+)", error)
+    return [f"• {removed} → {user} bunu kullanıyor" for removed, _, user in pairs]
+
+
+def print_protected():
+    installed = set(_output(["pacman", "-Qq"]).split())
+    has_flatpak_apps = bool(_output(["flatpak", "list", "--app", "--columns=application"]).strip())
+    protected, _ = compute_protection(installed, has_flatpak_apps)
+    for name in sorted(protected):
+        print(f"{name}\t{protected[name]}")
+
+
+# --------------------------------------------------------------------------
+# Arayüz
+# --------------------------------------------------------------------------
+
+if __name__ == "__main__" and "--korunanlar" in sys.argv[1:]:
+    print_protected()
+    sys.exit(0)
+
+from PyQt6.QtCore import QProcess, Qt, QThread, pyqtSignal  # noqa: E402
+from PyQt6.QtGui import QBrush, QFont, QIcon, QKeySequence, QPalette, QShortcut  # noqa: E402
+from PyQt6.QtWidgets import (  # noqa: E402
+    QAbstractItemView,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+
+class SizeItem(QTableWidgetItem):
+    """Boyut sütununu metne göre değil bayta göre sıralar."""
+
+    def __lt__(self, other):
+        return (self.data(Qt.ItemDataRole.UserRole) or 0) < (other.data(Qt.ItemDataRole.UserRole) or 0)
+
+
+class Loader(QThread):
+    loaded = pyqtSignal(object)
+
+    def run(self):
+        self.loaded.emit(load_packages())
+
+
+class RunDialog(QDialog):
+    """Komutları sırayla çalıştırıp çıktılarını canlı gösterir."""
+
+    def __init__(self, parent, steps: list[list[str]]):
+        super().__init__(parent)
+        self.setWindowTitle("Kaldırılıyor")
+        self.resize(760, 420)
+        self.steps = list(steps)
+        self.failed = False
+
+        self.log = QPlainTextEdit(readOnly=True)
+        self.log.setFont(QFont("monospace"))
+        self.state = QLabel("Çalışıyor… Yetki penceresi açılırsa şifreni gir.")
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        self.buttons.setEnabled(False)
+        self.buttons.rejected.connect(self.accept)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.log)
+        layout.addWidget(self.state)
+        layout.addWidget(self.buttons)
+
+        self.proc = QProcess(self)
+        self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.proc.readyReadStandardOutput.connect(self._read)
+        self.proc.finished.connect(self._step_finished)
+        self.proc.errorOccurred.connect(self._error)
+
+    def start(self):
+        self._next()
+        return self.exec()
+
+    def _read(self):
+        text = bytes(self.proc.readAllStandardOutput()).decode(errors="replace")
+        self.log.insertPlainText(text)
+        self.log.ensureCursorVisible()
+
+    def _next(self):
+        if not self.steps:
+            self._done()
+            return
+        cmd = self.steps.pop(0)
+        self.log.appendPlainText(f"$ {' '.join(cmd)}\n")
+        self.proc.start(cmd[0], cmd[1:])
+
+    def _step_finished(self, code, status):
+        if status != QProcess.ExitStatus.NormalExit or code != 0:
+            self.failed = True
+            reason = ("Yetkilendirme iptal edildi ya da reddedildi." if code in (126, 127)
+                      else f"Çıkış kodu {code}.")
+            self.log.appendPlainText(f"\n✗ İşlem başarısız. {reason}")
+            self._done()
+            return
+        self.log.appendPlainText("\n✓ Tamamlandı.\n")
+        self._next()
+
+    def _error(self, error):
+        if error == QProcess.ProcessError.FailedToStart:
+            self.failed = True
+            self.log.appendPlainText("\n✗ Komut başlatılamadı.")
+            self._done()
+
+    def _done(self):
+        self.state.setText("Bazı işlemler başarısız oldu, hiçbir şey kaldırılmamış olabilir."
+                           if self.failed else "Tüm işlemler tamamlandı.")
+        self.buttons.setEnabled(True)
+
+    def reject(self):
+        # Çalışırken pencere kapatılmasın
+        if self.buttons.isEnabled():
+            super().reject()
+
+
+class Window(QMainWindow):
+    COL_NAME, COL_SOURCE, COL_SIZE, COL_DESC = range(4)
+
+    def __init__(self, autoload: bool = True):
+        super().__init__()
+        self.setWindowTitle("Kaldır")
+        self.setWindowIcon(QIcon.fromTheme("edit-delete"))
+        self.resize(1000, 660)
+        self.packages: list[Package] = []
+        self.protected: dict[str, str] = {}
+        self.warn: dict[str, str] = {}
+        self.loader = None
+
+        self.search = QLineEdit(placeholderText="Ad veya açıklamaya göre ara…")
+        self.search.setClearButtonEnabled(True)
+        self.source = QComboBox()
+        self.source.addItems(["Tümü", "Pacman", "AUR", "Flatpak"])
+        self.show_protected = QCheckBox("Korumalı sistem paketlerini göster")
+        self.refresh_btn = QPushButton(QIcon.fromTheme("view-refresh"), "Yenile")
+
+        top = QHBoxLayout()
+        top.addWidget(self.search, 1)
+        top.addWidget(self.source)
+        top.addWidget(self.show_protected)
+        top.addWidget(self.refresh_btn)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Ad", "Kaynak", "Boyut", "Açıklama"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(False)
+        header = self.table.horizontalHeader()
+        for col in (self.COL_NAME, self.COL_SOURCE, self.COL_SIZE):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(self.COL_DESC, QHeaderView.ResizeMode.Stretch)
+
+        self.legend = QLabel("🔒 korumalı, seçilemez    ⚠ dikkat gerektirir    "
+                             "Satıra tıkla ya da Boşluk'a bas: seç")
+        self.legend.setEnabled(False)
+        self.status = QLabel("Yükleniyor…")
+        self.clear_btn = QPushButton("Seçimi temizle")
+        self.remove_btn = QPushButton(QIcon.fromTheme("edit-delete"), "Seçilenleri kaldır")
+        self.remove_btn.setEnabled(False)
+
+        bottom = QHBoxLayout()
+        bottom.addWidget(self.status, 1)
+        bottom.addWidget(self.clear_btn)
+        bottom.addWidget(self.remove_btn)
+
+        central = QWidget()
+        layout = QVBoxLayout(central)
+        layout.addLayout(top)
+        layout.addWidget(self.table, 1)
+        layout.addWidget(self.legend)
+        layout.addLayout(bottom)
+        self.setCentralWidget(central)
+
+        self.search.textChanged.connect(self.apply_filter)
+        self.source.currentIndexChanged.connect(self.apply_filter)
+        self.show_protected.toggled.connect(self.apply_filter)
+        self.refresh_btn.clicked.connect(self.load)
+        self.clear_btn.clicked.connect(self.clear_selection)
+        self.remove_btn.clicked.connect(self.remove_selected)
+        self.table.itemChanged.connect(self.update_status)
+        self.table.cellClicked.connect(self.toggle_row)
+        QShortcut(QKeySequence.StandardKey.Find, self, self.search.setFocus)
+        QShortcut(QKeySequence(Qt.Key.Key_Space), self.table, self.toggle_current)
+
+        if autoload:
+            self.load()
+
+    # --- Yükleme ve listeleme -------------------------------------------
+
+    def load(self):
+        self.refresh_btn.setEnabled(False)
+        self.remove_btn.setEnabled(False)
+        self.status.setText("Paketler okunuyor…")
+        self.loader = Loader()
+        self.loader.loaded.connect(self.populate)
+        self.loader.start()
+
+    def populate(self, result):
+        self.packages, self.protected, self.warn = result
+        dim = QBrush(self.palette().color(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text))
+        self.table.blockSignals(True)
+        self.table.setSortingEnabled(False)
+        self.table.clearContents()
+        self.table.setRowCount(len(self.packages))
+        for row, pkg in enumerate(self.packages):
+            name = QTableWidgetItem(pkg.name)
+            name.setData(Qt.ItemDataRole.UserRole, row)
+            source = QTableWidgetItem(pkg.source)
+            size = SizeItem(human(pkg.size))
+            size.setData(Qt.ItemDataRole.UserRole, pkg.size)
+            size.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            desc = QTableWidgetItem(pkg.description)
+            items = (name, source, size, desc)
+
+            if pkg.protected:
+                name.setFlags(name.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+                name.setText(f"🔒 {pkg.name}")
+                tip = f"Korumalı: {pkg.protected}"
+                for item in items:
+                    item.setForeground(dim)
+                    item.setToolTip(tip)
+            else:
+                name.setFlags(name.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                name.setCheckState(Qt.CheckState.Unchecked)
+                if pkg.warning:
+                    name.setText(f"⚠ {pkg.name}")
+                    tip = f"Dikkat: {pkg.warning}"
+                else:
+                    tip = pkg.description
+                for item in items:
+                    item.setToolTip(tip)
+
+            for col, item in enumerate(items):
+                self.table.setItem(row, col, item)
+        self.table.setSortingEnabled(True)
+        self.table.sortItems(self.COL_SIZE, Qt.SortOrder.DescendingOrder)
+        self.table.blockSignals(False)
+        self.refresh_btn.setEnabled(True)
+        self.apply_filter()
+        self.update_status()
+
+    def apply_filter(self):
+        text = self.search.text().strip().lower()
+        source = self.source.currentText()
+        show_protected = self.show_protected.isChecked()
+        for row in range(self.table.rowCount()):
+            pkg = self.package_at(row)
+            visible = ((source == "Tümü" or pkg.source == source)
+                       and (show_protected or not pkg.protected)
+                       and (not text or text in pkg.name.lower() or text in pkg.description.lower()))
+            self.table.setRowHidden(row, not visible)
+
+    def package_at(self, row: int) -> Package:
+        return self.packages[self.table.item(row, self.COL_NAME).data(Qt.ItemDataRole.UserRole)]
+
+    # --- Seçim -----------------------------------------------------------
+
+    def checked_packages(self) -> list[Package]:
+        result = []
+        for row in range(self.table.rowCount()):
+            pkg = self.package_at(row)
+            if not pkg.protected and self.table.item(row, self.COL_NAME).checkState() == Qt.CheckState.Checked:
+                result.append(pkg)
+        return result
+
+    def toggle_row(self, row: int, column: int):
+        if column == self.COL_NAME or self.package_at(row).protected:
+            return
+        item = self.table.item(row, self.COL_NAME)
+        item.setCheckState(Qt.CheckState.Unchecked if item.checkState() == Qt.CheckState.Checked
+                           else Qt.CheckState.Checked)
+
+    def toggle_current(self):
+        row = self.table.currentRow()
+        if row >= 0:
+            self.toggle_row(row, self.COL_SOURCE)
+
+    def clear_selection(self):
+        self.table.blockSignals(True)
+        for row in range(self.table.rowCount()):
+            if not self.package_at(row).protected:
+                self.table.item(row, self.COL_NAME).setCheckState(Qt.CheckState.Unchecked)
+        self.table.blockSignals(False)
+        self.update_status()
+
+    def update_status(self, *_):
+        selected = self.checked_packages()
+        removable = [p for p in self.packages if not p.protected]
+        locked = len(self.packages) - len(removable)
+        text = (f"{len(removable)} kaldırılabilir uygulama · {human(sum(p.size for p in removable))}"
+                f" · {locked} korumalı")
+        if selected:
+            text += f"   |   Seçilen: {len(selected)} · {human(sum(p.size for p in selected))}"
+        self.status.setText(text)
+        self.remove_btn.setEnabled(bool(selected))
+
+    # --- Kaldırma ------------------------------------------------------
+
+    def remove_selected(self):
+        selected = self.checked_packages()
+        if any(p.protected for p in selected):  # arayüz izin vermez; yine de kontrol
+            return
+        pacman_names = [p.name for p in selected if p.source in ("Pacman", "AUR")]
+        flatpaks = [p for p in selected if p.source == "Flatpak"]
+
+        lines, warnings, total = [], [], 0
+        keep_deps: list[str] = []
+        if pacman_names:
+            ok, items, error = preview_pacman_removal(pacman_names)
+            if not ok:
+                reasons = explain_dependency_error(error)
+                box = QMessageBox(QMessageBox.Icon.Warning, "Kaldırılamaz",
+                                  "Seçtiğin paketlerden en az biri başka bir paket tarafından "
+                                  "kullanılıyor, bu yüzden hiçbir şey kaldırılmadı.\n\n"
+                                  + ("\n".join(reasons) + "\n\n" if reasons else "")
+                                  + "Onu kullanan paketi de seçebilir ya da seçimini değiştirebilirsin.",
+                                  QMessageBox.StandardButton.Ok, self)
+                box.setDetailedText(error)
+                box.exec()
+                return
+
+            # İkinci kontrol: bağımlılık olarak korumalı bir paket silinecek mi?
+            # Öyleyse onu (ve ona gereken bağımlılıkları) yerinde bırak.
+            names_in_preview = {n for n, _ in items}
+            protected_deps = [n for n in names_in_preview if n in self.protected]
+            if protected_deps:
+                if any(n in pacman_names for n in protected_deps):  # olmamalı; yine de dur
+                    QMessageBox.critical(self, "Korumalı paket", "Korumalı bir paket seçilmiş, durduruldu.")
+                    return
+                kept = dependency_closure(protected_deps, names_in_preview)
+                keep_deps = sorted(protected_deps)
+                items = [(n, s) for n, s in items if n not in kept]
+                warnings += [f"🔒 {n} korunacak — {self.protected[n]}" for n in keep_deps]
+
+            for name, size in items:
+                note = "" if name in pacman_names else "  (artık gereksiz bağımlılık)"
+                lines.append(f"{name:<40} {human(size):>10}{note}")
+                total += size
+                if name in self.warn:
+                    warnings.append(f"⚠ {name} — {self.warn[name]}")
+        for pkg in flatpaks:
+            lines.append(f"{pkg.name:<40} {human(pkg.size):>10}  (Flatpak, {pkg.installation})")
+            total += pkg.size
+
+        text = (f"{len(lines)} paket kaldırılacak, yaklaşık {human(total)} yer açılacak.\n"
+                "Bu işlem geri alınamaz.")
+        if warnings:
+            text += "\n\nDikkat:\n" + "\n".join(warnings)
+        if keep_deps:
+            text += ("\n\n🔒 işaretliler bağımlılık olarak silinecekti; \"elle kurulmuş\" "
+                     "olarak işaretlenip yerinde bırakılacak.")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Kaldırma onayı")
+        box.setText(text)
+        box.setInformativeText("Kaldırılacakların tam listesi için \"Ayrıntıları göster\"e bas.")
+        box.setDetailedText("\n".join(lines))
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
+        box.button(QMessageBox.StandardButton.Yes).setText("Kaldır")
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            return
+
+        steps = []
+        if pacman_names and keep_deps:
+            # Tek yetki penceresiyle: önce korunacakları "elle kurulmuş" yap, sonra kaldır
+            script = ('set -e; n=$1; shift; pacman -D --asexplicit "${@:1:$n}"; '
+                      'shift "$n"; exec pacman -Rns --noconfirm "$@"')
+            steps.append(["pkexec", "/usr/bin/bash", "-c", script, "kaldir",
+                          str(len(keep_deps)), *keep_deps, *pacman_names])
+        elif pacman_names:
+            steps.append(["pkexec", "pacman", "-Rns", "--noconfirm", *pacman_names])
+        for installation in ("system", "user"):
+            ids = [p.name for p in flatpaks if p.installation == installation]
+            if ids:
+                steps.append(["flatpak", "uninstall", "--noninteractive", f"--{installation}", *ids])
+
+        RunDialog(self, steps).start()
+        self.load()
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("Kaldır")
+    app.setDesktopFileName("kaldir-gui")
+    window = Window()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

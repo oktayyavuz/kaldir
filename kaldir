@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# kaldir: Uygulamaları boyutlarına göre sıralayıp topluca kaldırır.
+#
+# Kullanım:
+#   kaldir           fzf ile seç, seçilenleri kaldır
+#   kaldir --liste   yalnızca boyuta göre sıralı listeyi yazdır (hiçbir şey silmez)
+#
+# Güvenlik: korumalı sistem paketleri (çekirdek, sürücüler, masaüstü, ağ...)
+# listede gösterilmez. Liste `kaldir-gui --korunanlar` komutundan gelir;
+# kendi korumalarını ~/.config/kaldir/korunan.txt dosyasına ekleyebilirsin.
+
+set -uo pipefail
+
+for arac in pacman fzf; do
+    command -v "$arac" >/dev/null || { echo "kaldir: '$arac' bulunamadı" >&2; exit 1; }
+done
+
+# Korumalı paket listesi alınamazsa hiçbir şey yapma
+korunan_dosya=$(mktemp)
+trap 'rm -f "$korunan_dosya"' EXIT
+kaldir_gui="$(dirname "$(readlink -f "$0")")/kaldir-gui"
+[ -x "$kaldir_gui" ] || kaldir_gui=$(command -v kaldir-gui || true)
+if [ -z "$kaldir_gui" ] || ! "$kaldir_gui" --korunanlar 2>/dev/null | cut -f1 > "$korunan_dosya" || [ ! -s "$korunan_dosya" ]; then
+    echo "kaldir: korumalı paket listesi alınamadı (kaldir-gui --korunanlar), güvenlik için durduruldu." >&2
+    exit 1
+fi
+
+# Paketleri topla: KAYNAK<TAB>DEĞER<TAB>BİRİM<TAB>PAKET
+paketleri_topla() {
+    # Pacman resmi depoları (elle kurulmuşlar)
+    LC_ALL=C pacman -Qeni 2>/dev/null | awk '
+        /^Name/ { pkg = $3 }
+        /^Installed Size/ { val = $4; gsub(/,/, ".", val); print "[PACMAN]\t" val "\t" $5 "\t" pkg }'
+
+    # AUR paketleri (elle kurulmuşlar)
+    LC_ALL=C pacman -Qemi 2>/dev/null | awk '
+        /^Name/ { pkg = $3 }
+        /^Installed Size/ { val = $4; gsub(/,/, ".", val); print "[AUR]\t" val "\t" $5 "\t" pkg }'
+
+    # Flatpak uygulamaları (flatpak sayı ile birim arasına bölünemez boşluk koyar; normal boşluğa çevir)
+    if command -v flatpak >/dev/null; then
+        LC_ALL=C flatpak list --app --columns=application,size 2>/dev/null | sed 's/\xc2\xa0/ /g' | awk '
+            NF >= 3 { val = $2; gsub(/,/, ".", val); print "[FLATPAK]\t" val "\t" $3 "\t" $1 }'
+    fi
+}
+
+# Boyutu bayta çevir, büyükten küçüğe sırala, hizalı liste bas
+sirali_liste() {
+    paketleri_topla | awk -F'\t' '
+        {
+            mult = 1; u = toupper(substr($3, 1, 1))
+            if (u == "K") mult = 1024
+            else if (u == "M") mult = 1048576
+            else if (u == "G") mult = 1073741824
+            else if (u == "T") mult = 1099511627776
+            printf "%16d\t%-10s\t%8.1f %-3s\t%s\n", $2 * mult, $1, $2, $3, $4
+        }' | sort -rn -k1,1 \
+        | awk -F'\t' 'NR == FNR { korunan[$1] = 1; next }
+                      ($2 == "[FLATPAK]" || !($4 in korunan)) { printf "%-10s %12s   %s\n", $2, $3, $4 }' \
+            "$korunan_dosya" -
+}
+
+if [[ ${1-} == --liste ]]; then
+    sirali_liste
+    exit 0
+fi
+
+mapfile -t secimler < <(sirali_liste | fzf --multi \
+    --prompt="Boyuta Göre Uygulama Ara > " \
+    --header="[Tab]: Çoklu Seç / Kaldır | [Enter]: Silmeyi Başlat" \
+    --marker="✓ ")
+
+# Hiçbir şey seçilmediyse çık
+(( ${#secimler[@]} )) || exit 0
+
+pacman_list=()
+flatpak_list=()
+
+# Seçilen paketleri kaynaklarına göre ayır (paket adı satırın son sütunu)
+for satir in "${secimler[@]}"; do
+    pkg=${satir##* }
+    case $satir in
+        '[PACMAN]'* | '[AUR]'*) pacman_list+=("$pkg") ;;
+        '[FLATPAK]'*) flatpak_list+=("$pkg") ;;
+    esac
+done
+
+# Pacman / AUR paketlerini kaldır (-Rns: başka paketlerin ihtiyaç duyduğu bir paket seçilirse
+# pacman reddeder; onu kullanan programlar sessizce silinmez)
+if (( ${#pacman_list[@]} )); then
+    # İkinci kontrol: bağımlılık zinciriyle korumalı bir paket araya giriyor mu?
+    if ! onizleme=$(LC_ALL=C pacman -Rs --print --print-format '%n' "${pacman_list[@]}" 2>&1); then
+        printf '\n\033[1;31m==>\033[0m Kaldırılamaz, hiçbir şey silinmedi:\n%s\n' "$onizleme" >&2
+        exit 1
+    fi
+    mapfile -t korunacak < <(grep -Fxf "$korunan_dosya" <<< "$onizleme" || true)
+    if (( ${#korunacak[@]} )); then
+        printf '\n\033[1;34m==>\033[0m Bu korumalı paketler bağımlılık olarak silinecekti; "elle kurulmuş" olarak işaretlenip korunacak: %s\n' "${korunacak[*]}"
+        sudo pacman -D --asexplicit "${korunacak[@]}" || exit 1
+    fi
+    printf '\n\033[1;33m==>\033[0m Sistem paketleri kaldırılıyor: %s\n' "${pacman_list[*]}"
+    sudo pacman -Rns "${pacman_list[@]}"
+fi
+
+# Flatpak uygulamalarını topluca kaldır
+if (( ${#flatpak_list[@]} )); then
+    printf '\n\033[1;34m==>\033[0m Flatpak uygulamaları kaldırılıyor: %s\n' "${flatpak_list[*]}"
+    flatpak uninstall "${flatpak_list[@]}"
+fi
