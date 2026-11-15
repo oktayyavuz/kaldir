@@ -4,6 +4,13 @@
 `kaldir` komutunun grafik arayüzlü sürümü. Pacman (resmi depo), AUR ve
 Flatpak uygulamalarını gösterir.
 
+Varsayılan olarak yalnızca gerçek programlar listelenir: uygulama menüsünde
+görünen (gizli olmayan bir .desktop girdisi olan) paketler ve Flatpak
+uygulamaları. Kütüphaneler, yazı tipleri, eklentiler ve komut satırı araçları
+"Tüm paketler" görünümünde kalır. Bir uygulama bir "demet" paketiyle gelmişse
+(örn. Steam, cachyos-gaming-applications ile) demet kaldırılır ama içindeki
+diğer programlar yerinde bırakılır.
+
 Güvenlik kuralları:
   * Korumalı paketler (çekirdek, önyükleyici, sürücüler, ağ, ses, masaüstü,
     temel sistem...) seçilemez.
@@ -14,8 +21,11 @@ Güvenlik kuralları:
     bir paket seçilirse pacman reddeder, onu kullananlar silinmez.
   * ~/.config/kaldir/korunan.txt dosyasına yazılan paketler de korunur.
 
-`kaldir-gui --korunanlar` korumalı paketleri "ad<TAB>neden" olarak yazdırır
-(terminaldeki `kaldir` komutu da bu listeyi kullanır).
+Terminal komutları (terminaldeki `kaldir` bunları kullanır):
+  kaldir-gui --korunanlar        korumalı paketler, "ad<TAB>neden"
+  kaldir-gui --liste [--hepsi]   kaldırılabilir uygulamalar,
+                                 "kaynak<TAB>bayt<TAB>paket<TAB>uygulama adı"
+  kaldir-gui --plan PAKET...     kaldırma planı (hiçbir şey silmez)
 """
 
 import glob
@@ -239,6 +249,18 @@ class Package:
     installation: str = ""   # Flatpak için "system" ya da "user"
     protected: str = ""      # boş değilse korumalı; değer = neden
     warning: str = ""        # boş değilse dikkat gerektirir; değer = neden
+    app_name: str = ""       # menüde görünen ad (uygulama değilse boş)
+    icon: str = ""           # simge adı ya da yolu
+    search_text: str = ""    # aramada kullanılan ek adlar
+    bundle: str = ""         # uygulama bir demet paketiyle geldiyse demetin adı
+
+    @property
+    def is_app(self) -> bool:
+        return bool(self.app_name)
+
+    @property
+    def title(self) -> str:
+        return self.app_name or self.name
 
 
 def to_bytes(value: str, unit: str) -> int:
@@ -293,16 +315,135 @@ def pacman_packages(flags: str, source: str) -> list[Package]:
 def flatpak_packages() -> list[Package]:
     packages = []
     out = _output(["flatpak", "list", "--app",
-                   "--columns=application,name,size,installation"])
+                   "--columns=application,name,description,size,installation"])
+    # flatpak sayı ile birim arasına bölünemez boşluk (U+00A0) koyar
     for line in out.replace(" ", " ").splitlines():
         parts = line.split("\t")
-        if len(parts) < 4:
+        if len(parts) < 5:
             continue
-        app_id, name, size, installation = parts[:4]
+        app_id, name, description, size, installation = parts[:5]
         value, unit = (size.split() + ["B"])[:2]
         packages.append(Package(app_id, "Flatpak", to_bytes(value, unit),
-                                name, installation.strip().lower()))
+                                description or name, installation.strip().lower(),
+                                app_name=name or app_id, icon=app_id))
     return packages
+
+
+# --------------------------------------------------------------------------
+# Hangi paket gerçekten bir program?
+# --------------------------------------------------------------------------
+
+DESKTOP_DIRS = ["/usr/share/applications", "/usr/local/share/applications"]
+
+
+def read_desktop_entry(path: str) -> dict | None:
+    """Menüde görünen bir uygulama girdisiyse alanlarını, değilse None döndürür."""
+    entry, inside = {}, False
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("["):
+                    if inside:
+                        break
+                    inside = line == "[Desktop Entry]"
+                elif inside and "=" in line and not line.startswith("#"):
+                    key, value = line.split("=", 1)
+                    entry.setdefault(key.strip(), value.strip())
+    except OSError:
+        return None
+    if entry.get("Type") != "Application":
+        return None
+    if entry.get("NoDisplay", "").lower() == "true" or entry.get("Hidden", "").lower() == "true":
+        return None
+    return entry
+
+
+def desktop_apps() -> dict[str, list[dict]]:
+    """Paket -> menüde görünen uygulama girdileri [{name, icon, file}]."""
+    entries = {}
+    for directory in DESKTOP_DIRS:
+        for root, _, files in os.walk(directory):
+            for file in files:
+                if file.endswith(".desktop"):
+                    path = os.path.join(root, file)
+                    entry = read_desktop_entry(path)
+                    if entry:
+                        entries[path] = entry
+    apps: dict[str, list[dict]] = {}
+    for path, pkg in _owners_of(sorted(entries)).items():
+        entry = entries[path]
+        stem = os.path.basename(path)[:-len(".desktop")]
+        apps.setdefault(pkg, []).append({
+            "name": entry.get("Name[tr]") or entry.get("Name") or stem,
+            "icon": entry.get("Icon", ""),
+            "file": stem,
+        })
+    return apps
+
+
+def primary_entry(pkg: str, entries: list[dict]) -> dict:
+    """Bir paketin birden çok girdisi varsa (LibreOffice gibi) ana olanı seçer."""
+    base = re.sub(r"-(bin|git|fresh|stable|desktop)$", "", pkg.lower())
+
+    def rank(entry):
+        stem = entry["file"].lower()
+        exact = stem in (pkg.lower(), base) or stem.rsplit(".", 1)[-1] == base
+        return (not exact, len(entry["name"]), entry["name"])
+    return min(entries, key=rank)
+
+
+def _dep_name(dep: str) -> str:
+    return re.split(r"[<>=]", dep)[0]
+
+
+@dataclass
+class SystemState:
+    """Kaldırma kararları için gereken her şey."""
+    protected: dict
+    warn: dict
+    depends: dict      # paket -> doğrudan bağımlılıkları (kurulu paket adlarıyla)
+    required_by: dict  # paket -> onu gerektiren paketler
+    bundles: set       # demet (meta) paketleri
+
+
+def resolve_depends(infos: list[dict]) -> dict[str, set[str]]:
+    installed = {i["Name"] for i in infos}
+    provides = {}
+    for info in infos:
+        for item in info.get("Provides", "None").split():
+            if item != "None":
+                provides.setdefault(_dep_name(item), info["Name"])
+    depends = {}
+    for info in infos:
+        result = set()
+        for dep in info.get("Depends On", "None").split():
+            name = _dep_name(dep)
+            if name in installed:
+                result.add(name)
+            elif name in provides:
+                result.add(provides[name])
+        depends[info["Name"]] = result
+    return depends
+
+
+def find_bundles(candidates: set[str]) -> set[str]:
+    """Kendi içinde program barındırmayan, yalnızca başka paketleri çeken demet paketleri."""
+    if not candidates:
+        return set()
+    files: dict[str, list[str]] = {name: [] for name in candidates}
+    for line in _output(["pacman", "-Ql", *sorted(candidates)]).splitlines():
+        name, _, path = line.partition(" ")
+        if path and not path.endswith("/"):
+            files.setdefault(name, []).append(path)
+    bundles = set()
+    for name, paths in files.items():
+        real = [p for p in paths if not p.startswith(("/usr/share/licenses/", "/usr/share/doc/"))]
+        if len(real) <= 3 and not any(
+                p.startswith(("/usr/bin/", "/opt/")) or ".so" in p or p.endswith(".desktop")
+                for p in real):
+            bundles.add(name)
+    return bundles
 
 
 def _owners(path: str) -> set[str]:
@@ -459,19 +600,51 @@ def compute_protection(installed: set[str], has_flatpak_apps: bool) -> tuple[dic
     return protected, warn
 
 
-def load_packages() -> tuple[list[Package], dict, dict]:
+def load_packages() -> tuple[list[Package], SystemState]:
+    """Elle kurulmuş paketler, demetle gelmiş uygulamalar ve Flatpak uygulamaları."""
+    infos = parse_pacman_info(_output(["pacman", "-Qi"]))
+    by_name = {i["Name"]: i for i in infos}
+    foreign = set(_output(["pacman", "-Qmq"]).split())
+    depends = resolve_depends(infos)
+    required_by = {name: set(i.get("Required By", "None").split()) - {"None"}
+                   for name, i in by_name.items()}
+    apps = desktop_apps()
+
+    # Bağımlılık olarak kurulmuş uygulamalar (örn. Steam) yalnızca bir demet
+    # paketinin parçasıysa listelenir; gerçek bir program onları kullanıyorsa değil.
+    candidates, stack = set(), [n for n in apps if n in by_name]
+    while stack:
+        for parent in required_by.get(stack.pop(), ()):
+            if parent not in candidates:
+                candidates.add(parent)
+                stack.append(parent)
+    bundles = find_bundles({c for c in candidates if c not in apps})
+
     flatpaks = flatpak_packages()
-    packages = (pacman_packages("-Qeni", "Pacman")
-                + pacman_packages("-Qemi", "AUR")
-                + flatpaks)
-    installed = set(_output(["pacman", "-Qq"]).split())
-    protected, warn = compute_protection(installed, bool(flatpaks))
-    for pkg in packages:
-        if pkg.source != "Flatpak":
-            pkg.protected = protected.get(pkg.name, "")
-            pkg.warning = warn.get(pkg.name, "")
+    protected, warn = compute_protection(set(by_name), bool(flatpaks))
+    state = SystemState(protected, warn, depends, required_by, bundles)
+
+    packages = []
+    for name, info in by_name.items():
+        explicit = info.get("Install Reason", "").startswith("Explicitly")
+        users = required_by.get(name, set())
+        bundled_app = name in apps and not explicit and users <= bundles
+        if not explicit and not bundled_app:
+            continue
+        value, unit = (info.get("Installed Size", "0 B").split() + ["B"])[:2]
+        pkg = Package(name, "AUR" if name in foreign else "Pacman", to_bytes(value, unit),
+                      info.get("Description", ""),
+                      protected=protected.get(name, ""), warning=warn.get(name, ""))
+        if name in apps:
+            entry = primary_entry(name, apps[name])
+            pkg.app_name, pkg.icon = entry["name"], entry["icon"]
+            pkg.search_text = " ".join(e["name"] for e in apps[name])
+        if bundled_app and users:
+            pkg.bundle = ", ".join(sorted(users))
+        packages.append(pkg)
+    packages += flatpaks
     packages.sort(key=lambda p: p.size, reverse=True)
-    return packages, protected, warn
+    return packages, state
 
 
 def preview_pacman_removal(names: list[str]) -> tuple[bool, list[tuple[str, int]], str]:
@@ -493,29 +666,82 @@ def preview_pacman_removal(names: list[str]) -> tuple[bool, list[tuple[str, int]
     return True, items, ""
 
 
-def dependency_closure(roots: list[str], candidates: set[str]) -> set[str]:
+def dependency_closure(roots: set[str], candidates: set[str], depends: dict) -> set[str]:
     """`roots` ve onların `candidates` içindeki (özyinelemeli) bağımlılıkları."""
-    if not candidates:
-        return set(roots)
-    info = {i["Name"]: i for i in parse_pacman_info(_output(["pacman", "-Qi", *sorted(candidates)]))}
     keep, stack = set(), list(roots)
     while stack:
         name = stack.pop()
         if name in keep:
             continue
         keep.add(name)
-        for dep in info.get(name, {}).get("Depends On", "").split():
-            dep = re.split(r"[<>=]", dep)[0]
-            if dep in candidates and dep not in keep:
-                stack.append(dep)
+        stack += [d for d in depends.get(name, ()) if d in candidates and d not in keep]
     return keep
 
 
-def explain_dependency_error(error: str) -> list[str]:
+def explain_dependency_error(error: str, titles: dict | None = None) -> list[str]:
     """pacman'in 'breaks dependency' hatalarını okunur satırlara çevirir."""
+    titles = titles or {}
     pairs = re.findall(r"removing (\S+) breaks dependency '([^']+)' required by (\S+)", error)
-    return [f"• {removed} → {user} bunu kullanıyor" for removed, _, user in pairs]
+    lines = []
+    for removed, _, user in pairs:
+        name = titles.get(user, user)
+        lines.append(f"• {name} ({user}) bunu kullanıyor: {removed}" if name != user
+                     else f"• {user} bunu kullanıyor: {removed}")
+    return list(dict.fromkeys(lines))
 
+
+@dataclass
+class RemovalPlan:
+    ok: bool
+    targets: list[str]                 # pacman -Rns'e verilecek paketler (seçilenler + demetler)
+    remove: list[tuple[str, int]]      # gerçekten silinecekler (paket, bayt)
+    keep: list[str]                    # önce "elle kurulmuş" yapılıp yerinde bırakılacaklar
+    bundles: list[str]                 # seçilen uygulama yüzünden kaldırılacak demet paketleri
+    reasons: list[str]                 # başarısızsa okunur nedenler
+    error: str = ""
+
+
+def plan_pacman_removal(names: list[str], state: SystemState,
+                        titles: dict | None = None) -> RemovalPlan:
+    """Kaldırma planı çıkarır, hiçbir şey silmez.
+
+    * Seçilen bir uygulamayı yalnızca demet paketleri kullanıyorsa demet de
+      kaldırılır, ama demetin içindeki diğer paketler yerinde bırakılır.
+    * Başka bir gerçek paket kullanıyorsa plan başarısız olur.
+    * Bağımlılık olarak silinecek korumalı paketler yerinde bırakılır.
+    """
+    if any(n in state.protected for n in names):
+        bad = [n for n in names if n in state.protected]
+        return RemovalPlan(False, list(names), [], [], [],
+                           [f"• {n} korumalı — {state.protected[n]}" for n in bad])
+    targets, bundles = list(names), []
+    for _ in range(8):
+        ok, items, error = preview_pacman_removal(targets)
+        if ok:
+            break
+        users = set(re.findall(r"breaks dependency '[^']+' required by (\S+)", error)) - set(targets)
+        if users and all(u in state.bundles and u not in state.protected for u in users):
+            bundles += sorted(users)
+            targets += sorted(users)
+            continue
+        return RemovalPlan(False, targets, [], [], bundles,
+                           explain_dependency_error(error, titles), error)
+    else:
+        return RemovalPlan(False, targets, [], [], bundles, ["• Bağımlılık zinciri çözülemedi"], error)
+
+    in_preview = {n for n, _ in items}
+    roots = {n for n in in_preview if n in state.protected}
+    for bundle in bundles:
+        roots |= {d for d in state.depends.get(bundle, ()) if d in in_preview}
+    roots -= set(targets)
+    kept = dependency_closure(roots, in_preview - set(targets), state.depends)
+    remove = [(n, s) for n, s in items if n not in kept]
+    return RemovalPlan(True, targets, remove, sorted(roots), bundles, [])
+
+
+# --------------------------------------------------------------------------
+# Terminal komutları
+# --------------------------------------------------------------------------
 
 def print_protected():
     installed = set(_output(["pacman", "-Qq"]).split())
@@ -525,15 +751,49 @@ def print_protected():
         print(f"{name}\t{protected[name]}")
 
 
+def print_list(everything: bool):
+    packages, _ = load_packages()
+    for pkg in packages:
+        if pkg.protected or not (everything or pkg.is_app):
+            continue
+        print(f"{pkg.source}\t{pkg.size}\t{pkg.name}\t{pkg.title}")
+
+
+def print_plan(names: list[str]) -> int:
+    """Satırlar: KALDIR ad bayt | KORU ad neden | DEMET ad | HATA metin"""
+    packages, state = load_packages()
+    plan = plan_pacman_removal(names, state, {p.name: p.title for p in packages})
+    if not plan.ok:
+        for reason in plan.reasons or [plan.error]:
+            print(f"HATA\t{reason}")
+        return 1
+    for name in plan.bundles:
+        print(f"DEMET\t{name}")
+    for name in plan.keep:
+        why = state.protected.get(name) or "Demetin içindeki diğer paket; yerinde kalır"
+        print(f"KORU\t{name}\t{why}")
+    for name, size in plan.remove:
+        print(f"KALDIR\t{name}\t{size}")
+    return 0
+
+
+if __name__ == "__main__":
+    _args = sys.argv[1:]
+    if "--korunanlar" in _args:
+        print_protected()
+        sys.exit(0)
+    if "--liste" in _args:
+        print_list("--hepsi" in _args)
+        sys.exit(0)
+    if "--plan" in _args:
+        sys.exit(print_plan([a for a in _args if not a.startswith("--")]))
+
+
 # --------------------------------------------------------------------------
 # Arayüz
 # --------------------------------------------------------------------------
 
-if __name__ == "__main__" and "--korunanlar" in sys.argv[1:]:
-    print_protected()
-    sys.exit(0)
-
-from PyQt6.QtCore import QProcess, Qt, QThread, pyqtSignal  # noqa: E402
+from PyQt6.QtCore import QProcess, QSize, Qt, QThread, pyqtSignal  # noqa: E402
 from PyQt6.QtGui import QBrush, QFont, QIcon, QKeySequence, QPalette, QShortcut  # noqa: E402
 from PyQt6.QtWidgets import (  # noqa: E402
     QAbstractItemView,
@@ -644,41 +904,82 @@ class RunDialog(QDialog):
             super().reject()
 
 
+def ensure_icon_theme():
+    """Simge teması bulunamazsa (Plasma dışında ya da görünmez modda) KDE ayarını kullan."""
+    dirs = os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":")
+    paths = [os.path.expanduser("~/.local/share/icons")] + [os.path.join(d, "icons") for d in dirs]
+    current = QIcon.themeSearchPaths()
+    QIcon.setThemeSearchPaths(current + [p for p in paths if p not in current and os.path.isdir(p)])
+    if QIcon.themeName() in ("", "hicolor"):
+        theme = ""
+        try:
+            with open(os.path.expanduser("~/.config/kdeglobals"), encoding="utf-8") as f:
+                inside = False
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("["):
+                        inside = line == "[Icons]"
+                    elif inside and line.startswith("Theme="):
+                        theme = line.split("=", 1)[1].strip()
+        except OSError:
+            pass
+        QIcon.setThemeName(theme or "breeze")
+
+
+def app_icon(pkg: Package) -> QIcon:
+    if pkg.icon and os.path.isabs(pkg.icon) and os.path.exists(pkg.icon):
+        return QIcon(pkg.icon)
+    fallback = "application-x-executable" if pkg.is_app else "package-x-generic"
+    if pkg.icon and not QIcon.hasThemeIcon(pkg.icon):
+        for ext in (".svg", ".png", ".xpm"):
+            path = f"/usr/share/pixmaps/{pkg.icon}{ext}"
+            if os.path.exists(path):
+                return QIcon(path)
+    return QIcon.fromTheme(pkg.icon or fallback, QIcon.fromTheme(fallback))
+
+
 class Window(QMainWindow):
-    COL_NAME, COL_SOURCE, COL_SIZE, COL_DESC = range(4)
+    COL_NAME, COL_PKG, COL_SOURCE, COL_SIZE, COL_DESC = range(5)
+    SCOPE_APPS, SCOPE_ALL = range(2)
 
     def __init__(self, autoload: bool = True):
         super().__init__()
         self.setWindowTitle("Kaldır")
         self.setWindowIcon(QIcon.fromTheme("edit-delete"))
-        self.resize(1000, 660)
+        self.resize(1100, 680)
         self.packages: list[Package] = []
-        self.protected: dict[str, str] = {}
-        self.warn: dict[str, str] = {}
+        self.state: SystemState | None = None
         self.loader = None
 
-        self.search = QLineEdit(placeholderText="Ad veya açıklamaya göre ara…")
+        self.search = QLineEdit(placeholderText="Uygulama, paket ya da açıklamaya göre ara…")
         self.search.setClearButtonEnabled(True)
+        self.scope = QComboBox()
+        self.scope.addItems(["Uygulamalar", "Tüm paketler (gelişmiş)"])
+        self.scope.setToolTip("Uygulamalar: menüde görünen programlar ve Flatpak uygulamaları.\n"
+                              "Tüm paketler: kütüphaneler, yazı tipleri, eklentiler ve "
+                              "komut satırı araçları dahil elle kurulmuş her şey.")
         self.source = QComboBox()
-        self.source.addItems(["Tümü", "Pacman", "AUR", "Flatpak"])
-        self.show_protected = QCheckBox("Korumalı sistem paketlerini göster")
+        self.source.addItems(["Tüm kaynaklar", "Pacman", "AUR", "Flatpak"])
+        self.show_protected = QCheckBox("Korumalıları göster")
         self.refresh_btn = QPushButton(QIcon.fromTheme("view-refresh"), "Yenile")
 
         top = QHBoxLayout()
         top.addWidget(self.search, 1)
+        top.addWidget(self.scope)
         top.addWidget(self.source)
         top.addWidget(self.show_protected)
         top.addWidget(self.refresh_btn)
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Ad", "Kaynak", "Boyut", "Açıklama"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Uygulama", "Paket", "Kaynak", "Boyut", "Açıklama"])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         self.table.setWordWrap(False)
+        self.table.setIconSize(QSize(22, 22))
         header = self.table.horizontalHeader()
-        for col in (self.COL_NAME, self.COL_SOURCE, self.COL_SIZE):
+        for col in (self.COL_NAME, self.COL_PKG, self.COL_SOURCE, self.COL_SIZE):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(self.COL_DESC, QHeaderView.ResizeMode.Stretch)
 
@@ -704,6 +1005,7 @@ class Window(QMainWindow):
         self.setCentralWidget(central)
 
         self.search.textChanged.connect(self.apply_filter)
+        self.scope.currentIndexChanged.connect(self.apply_filter)
         self.source.currentIndexChanged.connect(self.apply_filter)
         self.show_protected.toggled.connect(self.apply_filter)
         self.refresh_btn.clicked.connect(self.load)
@@ -722,45 +1024,46 @@ class Window(QMainWindow):
     def load(self):
         self.refresh_btn.setEnabled(False)
         self.remove_btn.setEnabled(False)
-        self.status.setText("Paketler okunuyor…")
+        self.status.setText("Uygulamalar okunuyor…")
         self.loader = Loader()
         self.loader.loaded.connect(self.populate)
         self.loader.start()
 
     def populate(self, result):
-        self.packages, self.protected, self.warn = result
+        self.packages, self.state = result
         dim = QBrush(self.palette().color(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text))
         self.table.blockSignals(True)
         self.table.setSortingEnabled(False)
         self.table.clearContents()
         self.table.setRowCount(len(self.packages))
         for row, pkg in enumerate(self.packages):
-            name = QTableWidgetItem(pkg.name)
+            name = QTableWidgetItem(app_icon(pkg), pkg.title)
             name.setData(Qt.ItemDataRole.UserRole, row)
+            package = QTableWidgetItem(pkg.name)
             source = QTableWidgetItem(pkg.source)
             size = SizeItem(human(pkg.size))
             size.setData(Qt.ItemDataRole.UserRole, pkg.size)
             size.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             desc = QTableWidgetItem(pkg.description)
-            items = (name, source, size, desc)
+            items = (name, package, source, size, desc)
 
             if pkg.protected:
                 name.setFlags(name.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
-                name.setText(f"🔒 {pkg.name}")
+                name.setText(f"🔒 {pkg.title}")
                 tip = f"Korumalı: {pkg.protected}"
                 for item in items:
                     item.setForeground(dim)
-                    item.setToolTip(tip)
             else:
                 name.setFlags(name.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 name.setCheckState(Qt.CheckState.Unchecked)
+                tip = pkg.description
                 if pkg.warning:
-                    name.setText(f"⚠ {pkg.name}")
+                    name.setText(f"⚠ {pkg.title}")
                     tip = f"Dikkat: {pkg.warning}"
-                else:
-                    tip = pkg.description
-                for item in items:
-                    item.setToolTip(tip)
+            if pkg.bundle:
+                tip += f"\n{pkg.bundle} demetiyle kuruldu; kaldırırsan demetteki diğer programlar kalır."
+            for item in items:
+                item.setToolTip(tip)
 
             for col, item in enumerate(items):
                 self.table.setItem(row, col, item)
@@ -771,16 +1074,20 @@ class Window(QMainWindow):
         self.apply_filter()
         self.update_status()
 
+    def is_listed(self, pkg: Package) -> bool:
+        """Arama dışındaki süzgeçler (görünüm, kaynak, korumalılar)."""
+        source = self.source.currentText()
+        return ((self.scope.currentIndex() == self.SCOPE_ALL or pkg.is_app)
+                and (source == "Tüm kaynaklar" or pkg.source == source)
+                and (self.show_protected.isChecked() or not pkg.protected))
+
     def apply_filter(self):
         text = self.search.text().strip().lower()
-        source = self.source.currentText()
-        show_protected = self.show_protected.isChecked()
         for row in range(self.table.rowCount()):
             pkg = self.package_at(row)
-            visible = ((source == "Tümü" or pkg.source == source)
-                       and (show_protected or not pkg.protected)
-                       and (not text or text in pkg.name.lower() or text in pkg.description.lower()))
-            self.table.setRowHidden(row, not visible)
+            haystack = f"{pkg.title} {pkg.name} {pkg.description} {pkg.search_text}".lower()
+            self.table.setRowHidden(row, not (self.is_listed(pkg) and (not text or text in haystack)))
+        self.update_status()
 
     def package_at(self, row: int) -> Package:
         return self.packages[self.table.item(row, self.COL_NAME).data(Qt.ItemDataRole.UserRole)]
@@ -817,10 +1124,14 @@ class Window(QMainWindow):
 
     def update_status(self, *_):
         selected = self.checked_packages()
-        removable = [p for p in self.packages if not p.protected]
-        locked = len(self.packages) - len(removable)
-        text = (f"{len(removable)} kaldırılabilir uygulama · {human(sum(p.size for p in removable))}"
-                f" · {locked} korumalı")
+        source = self.source.currentText()
+        listed = [p for p in self.packages
+                  if (self.scope.currentIndex() == self.SCOPE_ALL or p.is_app)
+                  and (source == "Tüm kaynaklar" or p.source == source)]
+        removable = [p for p in listed if not p.protected]
+        kind = "uygulama" if self.scope.currentIndex() == self.SCOPE_APPS else "paket"
+        text = (f"{len(removable)} kaldırılabilir {kind} · {human(sum(p.size for p in removable))}"
+                f" · {len(listed) - len(removable)} korumalı")
         if selected:
             text += f"   |   Seçilen: {len(selected)} · {human(sum(p.size for p in selected))}"
         self.status.setText(text)
@@ -830,57 +1141,61 @@ class Window(QMainWindow):
 
     def remove_selected(self):
         selected = self.checked_packages()
-        if any(p.protected for p in selected):  # arayüz izin vermez; yine de kontrol
+        if any(p.protected for p in selected) or self.state is None:
             return
         pacman_names = [p.name for p in selected if p.source in ("Pacman", "AUR")]
         flatpaks = [p for p in selected if p.source == "Flatpak"]
+        titles = {p.name: p.title for p in self.packages}
 
-        lines, warnings, total = [], [], 0
-        keep_deps: list[str] = []
+        lines, warnings, notes, total = [], [], [], 0
+        plan = None
         if pacman_names:
-            ok, items, error = preview_pacman_removal(pacman_names)
-            if not ok:
-                reasons = explain_dependency_error(error)
+            plan = plan_pacman_removal(pacman_names, self.state, titles)
+            if not plan.ok:
                 box = QMessageBox(QMessageBox.Icon.Warning, "Kaldırılamaz",
-                                  "Seçtiğin paketlerden en az biri başka bir paket tarafından "
-                                  "kullanılıyor, bu yüzden hiçbir şey kaldırılmadı.\n\n"
-                                  + ("\n".join(reasons) + "\n\n" if reasons else "")
-                                  + "Onu kullanan paketi de seçebilir ya da seçimini değiştirebilirsin.",
+                                  "Seçtiklerinden en az birini başka bir program kullanıyor, "
+                                  "bu yüzden hiçbir şey kaldırılmadı.\n\n"
+                                  + ("\n".join(plan.reasons) + "\n\n" if plan.reasons else "")
+                                  + "Onu kullanan programı da seçebilir ya da seçimini değiştirebilirsin.",
                                   QMessageBox.StandardButton.Ok, self)
-                box.setDetailedText(error)
+                if plan.error:
+                    box.setDetailedText(plan.error)
                 box.exec()
                 return
 
-            # İkinci kontrol: bağımlılık olarak korumalı bir paket silinecek mi?
-            # Öyleyse onu (ve ona gereken bağımlılıkları) yerinde bırak.
-            names_in_preview = {n for n, _ in items}
-            protected_deps = [n for n in names_in_preview if n in self.protected]
-            if protected_deps:
-                if any(n in pacman_names for n in protected_deps):  # olmamalı; yine de dur
-                    QMessageBox.critical(self, "Korumalı paket", "Korumalı bir paket seçilmiş, durduruldu.")
-                    return
-                kept = dependency_closure(protected_deps, names_in_preview)
-                keep_deps = sorted(protected_deps)
-                items = [(n, s) for n, s in items if n not in kept]
-                warnings += [f"🔒 {n} korunacak — {self.protected[n]}" for n in keep_deps]
-
-            for name, size in items:
-                note = "" if name in pacman_names else "  (artık gereksiz bağımlılık)"
-                lines.append(f"{name:<40} {human(size):>10}{note}")
+            for name, size in plan.remove:
+                if name in pacman_names:
+                    note = ""
+                elif name in plan.bundles:
+                    note = "  (demet paketi, yalnızca liste)"
+                else:
+                    note = "  (artık gereksiz bağımlılık)"
+                label = titles.get(name, name) if name in pacman_names else name
+                lines.append(f"{label:<40} {human(size):>10}{note}")
                 total += size
-                if name in self.warn:
-                    warnings.append(f"⚠ {name} — {self.warn[name]}")
+                if name in self.state.warn and name not in plan.bundles:
+                    warnings.append(f"⚠ {name} — {self.state.warn[name]}")
+            protected_kept = [n for n in plan.keep if n in self.state.protected]
+            bundle_kept = [n for n in plan.keep if n not in self.state.protected]
+            warnings += [f"🔒 {n} korunacak — {self.state.protected[n]}" for n in protected_kept]
+            if plan.bundles:
+                apps_kept = [titles[n] for n in bundle_kept if n in titles]
+                notes.append(
+                    f"📦 Seçtiğin program {', '.join(plan.bundles)} demetiyle kurulmuş. "
+                    "Demet paketi de kaldırılacak; içindeki diğer paketler yerinde kalacak"
+                    + (f" ({', '.join(apps_kept)})." if apps_kept else "."))
+            if plan.keep:
+                notes.append("Yerinde kalacak paketler \"elle kurulmuş\" olarak işaretlenecek.")
         for pkg in flatpaks:
-            lines.append(f"{pkg.name:<40} {human(pkg.size):>10}  (Flatpak, {pkg.installation})")
+            lines.append(f"{pkg.title:<40} {human(pkg.size):>10}  (Flatpak, {pkg.installation})")
             total += pkg.size
 
-        text = (f"{len(lines)} paket kaldırılacak, yaklaşık {human(total)} yer açılacak.\n"
-                "Bu işlem geri alınamaz.")
+        text = (f"{len(selected)} program kaldırılacak ({len(lines)} paket), "
+                f"yaklaşık {human(total)} yer açılacak.\nBu işlem geri alınamaz.")
         if warnings:
             text += "\n\nDikkat:\n" + "\n".join(warnings)
-        if keep_deps:
-            text += ("\n\n🔒 işaretliler bağımlılık olarak silinecekti; \"elle kurulmuş\" "
-                     "olarak işaretlenip yerinde bırakılacak.")
+        if notes:
+            text += "\n\n" + "\n".join(notes)
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowTitle("Kaldırma onayı")
@@ -894,14 +1209,14 @@ class Window(QMainWindow):
             return
 
         steps = []
-        if pacman_names and keep_deps:
-            # Tek yetki penceresiyle: önce korunacakları "elle kurulmuş" yap, sonra kaldır
+        if plan and plan.keep:
+            # Tek yetki penceresiyle: önce kalacakları "elle kurulmuş" yap, sonra kaldır
             script = ('set -e; n=$1; shift; pacman -D --asexplicit "${@:1:$n}"; '
                       'shift "$n"; exec pacman -Rns --noconfirm "$@"')
             steps.append(["pkexec", "/usr/bin/bash", "-c", script, "kaldir",
-                          str(len(keep_deps)), *keep_deps, *pacman_names])
-        elif pacman_names:
-            steps.append(["pkexec", "pacman", "-Rns", "--noconfirm", *pacman_names])
+                          str(len(plan.keep)), *plan.keep, *plan.targets])
+        elif plan:
+            steps.append(["pkexec", "pacman", "-Rns", "--noconfirm", *plan.targets])
         for installation in ("system", "user"):
             ids = [p.name for p in flatpaks if p.installation == installation]
             if ids:
@@ -915,6 +1230,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Kaldır")
     app.setDesktopFileName("kaldir-gui")
+    ensure_icon_theme()
     window = Window()
     window.show()
     sys.exit(app.exec())

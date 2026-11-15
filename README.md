@@ -1,10 +1,13 @@
 # Kaldır
 
 Arch tabanlı dağıtımlar (Arch, CachyOS, EndeavourOS…) için **güvenli uygulama kaldırıcı**.
-Kurulu uygulamaları boyutlarına göre sıralar, seçtiklerini topluca kaldırır ve
+Kurulu programları boyutlarına göre sıralar, seçtiklerini topluca kaldırır ve
 sistemi bozabilecek paketlere dokunmaz.
 
-Pacman (resmi depo), AUR ve Flatpak uygulamalarını birlikte gösterir. İki şekilde kullanılır:
+Paket listesi değil, **program listesi** gösterir: yalnızca uygulama menüsünde görünen
+programlar ve Flatpak uygulamaları listelenir. Kütüphaneler, yazı tipleri, eklentiler ve
+komut satırı araçları varsayılan olarak gizlidir. Pacman (resmi depo), AUR ve Flatpak
+birlikte gösterilir. İki şekilde kullanılır:
 
 - **`kaldir-gui`**: KDE Plasma ile uyumlu grafik arayüz (PyQt6)
 - **`kaldir`**: terminalde `fzf` ile çalışan hızlı sürüm
@@ -17,10 +20,12 @@ Rastgele bir paket silmek sistemi açılmaz hale getirebilir. Kaldır bunu birka
 
 | Katman | Ne yapar |
 | :-- | :-- |
+| 🎯 **Yalnızca programlar** | Menüde görünmeyen paketler (kütüphane, sürücü, yazı tipi, eklenti) listeye hiç girmez; onları görmek için “Tüm paketler” görünümüne geçmek gerekir. |
 | 🔒 **Korumalı paketler** | Çekirdek, önyükleyici, sürücüler, ağ, ses, Plasma masaüstü, giriş ekranı, güvenlik duvarı ve temel sistem paketleri **seçilemez**. |
 | 🔍 **Makineye göre algılama** | Çalışan ve yedek çekirdek, giriş ekranı, varsayılan kabuk, açılış imajına bağlı paketler otomatik bulunur. |
 | ⚠ **Dikkat uyarıları** | Açılışta çalışan servisler, `.zshrc` içinde kullanılan komutlar ve oturumla başlayan programlar otomatik işaretlenir; onayda ayrıca uyarılır. |
 | 🧩 **Bağımlılık kontrolü** | Pacman paketleri `-Rns` ile kaldırılır. Başka bir programın ihtiyaç duyduğu bir paket seçilirse hiçbir şey silinmez ve nedeni okunur şekilde gösterilir (örn. *“vlc → vlc-luajit bunu kullanıyor”*). |
+| 📦 **Demet paketleri** | Bir program bir demetle gelmişse (örn. Steam, `cachyos-gaming-applications` ile) yalnızca demet kaydı kaldırılır; demetteki diğer programlar (Lutris, Heroic…) yerinde kalır. |
 | 🛡 **İkinci kontrol** | Silmeden hemen önce pacman'in tam listesi korumalı listeyle karşılaştırılır. Korumalı bir paket bağımlılık olarak silinecekse “elle kurulmuş” olarak işaretlenip yerinde bırakılır. |
 | ✅ **Açık onay** | Neyin silineceği ve ne kadar yer açılacağı gösterilir; varsayılan buton “İptal”dir. Yetki, sistemin kendi penceresiyle (`pkexec`) istenir. |
 
@@ -49,18 +54,20 @@ kaldir-gui
 ```
 
 - Satıra tıkla ya da **Boşluk** tuşuna bas: seç / seçimi kaldır
-- `Ctrl+F`: arama
+- `Ctrl+F`: arama (uygulama adı, paket adı ya da açıklama)
+- Görünüm: **Uygulamalar** (varsayılan) ya da **Tüm paketler (gelişmiş)**
 - Kaynağa göre süz: Pacman, AUR, Flatpak
-- “Korumalı sistem paketlerini göster” ile korunanları ve nedenlerini gör (üzerine gel)
+- “Korumalıları göster” ile korunanları ve nedenlerini gör (üzerine gel)
 
 ### Terminal
 
 ```bash
-kaldir           # fzf ile seç (Tab: çoklu seçim, Enter: kaldır)
+kaldir           # fzf ile program seç (Tab: çoklu seçim, Enter: kaldır)
+kaldir --hepsi   # kütüphaneler ve araçlar dahil tüm paketlerden seç
 kaldir --liste   # yalnızca boyuta göre sıralı listeyi yazdır, hiçbir şey silmez
 ```
 
-Terminal sürümü de aynı koruma listesini kullanır; korumalı paketler listede görünmez.
+Terminal sürümü arayüzle aynı listeyi ve aynı kaldırma planını kullanır; korumalı paketler listede görünmez.
 
 ### Korumalı paket listesini görmek
 
